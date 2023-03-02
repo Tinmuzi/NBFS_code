@@ -34,6 +34,13 @@ struct bio_vec {
 	unsigned int	bv_offset;
 };
 
+struct bvec_meta {
+	unsigned long **bi_metabase;
+	unsigned int bi_metafilled;
+	unsigned int iter;
+	unsigned short idx;
+};
+
 struct bvec_iter {
 	sector_t		bi_sector;	/* device address in 512 byte
 						   sectors */
@@ -65,6 +72,7 @@ static inline struct page *bvec_nth_page(struct page *page, int idx)
 /* multi-page (mp_bvec) helpers */
 #define mp_bvec_iter_page(bvec, iter)				\
 	(__bvec_iter_bvec((bvec), (iter))->bv_page)
+
 
 #define mp_bvec_iter_len(bvec, iter)				\
 	min((iter).bi_size,					\

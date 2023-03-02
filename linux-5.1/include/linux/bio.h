@@ -83,6 +83,16 @@ static inline bool bio_has_data(struct bio *bio)
 	return false;
 }
 
+static inline bool bio_has_metadata(struct bio *bio)
+{
+	if (bio &&
+	    bio->bi_meta.bi_metabase)
+		return true;
+
+	return false;
+}
+
+
 static inline bool bio_no_advance_iter(struct bio *bio)
 {
 	return bio_op(bio) == REQ_OP_DISCARD ||
@@ -112,6 +122,13 @@ static inline void *bio_data(struct bio *bio)
 	if (bio_has_data(bio))
 		return page_address(bio_page(bio)) + bio_offset(bio);
 
+	return NULL;
+}
+
+static inline unsigned long *bio_metadata(struct bio *bio)
+{
+	if (bio_has_metadata(bio))
+		return bio->bi_meta.bi_metabase[bio->bi_meta.iter];
 	return NULL;
 }
 
@@ -381,13 +398,18 @@ static inline struct bio *bio_next_split(struct bio *bio, int sectors,
 enum {
 	BIOSET_NEED_BVECS = BIT(0),
 	BIOSET_NEED_RESCUER = BIT(1),
+	BIOSET_NEED_BMETA = BIT(2),
 };
 extern int bioset_init(struct bio_set *, unsigned int, unsigned int, int flags);
 extern void bioset_exit(struct bio_set *);
 extern int biovec_init_pool(mempool_t *pool, int pool_entries);
+extern int biometa_init_pool(mempool_t *pool, int pool_entries);
 extern int bioset_init_from_src(struct bio_set *bs, struct bio_set *src);
 
 extern struct bio *bio_alloc_bioset(gfp_t, unsigned int, struct bio_set *);
+extern struct bio *bio_alloc_bioset_withmeta(gfp_t gfp_mask, unsigned int nr_iovecs,
+				unsigned int nr_meta,
+			    struct bio_set *bs);
 extern void bio_put(struct bio *);
 
 extern void __bio_clone_fast(struct bio *, struct bio *);
@@ -398,6 +420,11 @@ extern struct bio_set fs_bio_set;
 static inline struct bio *bio_alloc(gfp_t gfp_mask, unsigned int nr_iovecs)
 {
 	return bio_alloc_bioset(gfp_mask, nr_iovecs, &fs_bio_set);
+}
+
+static inline struct bio *bio_alloc_withmeta(gfp_t gfp_mask, unsigned int nr_iovecs, unsigned int nr_meta)
+{
+	return bio_alloc_bioset_withmeta(gfp_mask, nr_iovecs, nr_meta, &fs_bio_set);
 }
 
 static inline struct bio *bio_kmalloc(gfp_t gfp_mask, unsigned int nr_iovecs)
@@ -434,10 +461,14 @@ extern void bio_reset(struct bio *);
 void bio_chain(struct bio *, struct bio *);
 
 extern int bio_add_page(struct bio *, struct page *, unsigned int,unsigned int);
+extern int bio_add_page_with_meta(struct bio *bio, struct page *page,
+		 unsigned int len, unsigned int offset, unsigned long *pmeta);
 extern int bio_add_pc_page(struct request_queue *, struct bio *, struct page *,
 			   unsigned int, unsigned int);
 bool __bio_try_merge_page(struct bio *bio, struct page *page,
 		unsigned int len, unsigned int off, bool same_page);
+bool __bio_try_merge_page_withmeta(struct bio *bio, struct page *page,
+		unsigned int len, unsigned int off, unsigned long *pmeta, bool same_page);
 void __bio_add_page(struct bio *bio, struct page *page,
 		unsigned int len, unsigned int off);
 int bio_iov_iter_get_pages(struct bio *bio, struct iov_iter *iter);
@@ -716,6 +747,7 @@ struct bio_set {
 
 	mempool_t bio_pool;
 	mempool_t bvec_pool;
+	mempool_t bmeta_pool;
 #if defined(CONFIG_BLK_DEV_INTEGRITY)
 	mempool_t bio_integrity_pool;
 	mempool_t bvec_integrity_pool;

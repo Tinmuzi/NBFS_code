@@ -2,6 +2,8 @@
 #ifndef NVM_H
 #define NVM_H
 
+#include <linux/blk-mq.h>
+
 #include <linux/blkdev.h>
 #include <linux/types.h>
 #include <uapi/linux/lightnvm.h>
@@ -69,11 +71,13 @@ struct ppa_addr {
 		} m;
 
 		struct {
-			u64 line	: 63;
+			u64 line	: 47;
+			u64 q_idx	:16;
 			u64 is_cached	: 1;
 		} c;
 
 		u64 ppa;
+		atomic64_t ppa_atomic;
 	};
 };
 
@@ -406,6 +410,8 @@ struct nvm_tgt_dev {
 	struct ppa_addr *luns;
 
 	struct request_queue *q;
+	struct blk_mq_tag_set *tag_set;
+	struct blk_mq_tag_set __tag_set;
 
 	struct nvm_dev *parent;
 	void *map;
@@ -633,8 +639,8 @@ static inline int nvm_next_ppa_in_chk(struct nvm_tgt_dev *dev,
 
 typedef blk_qc_t (nvm_tgt_make_rq_fn)(struct request_queue *, struct bio *);
 typedef sector_t (nvm_tgt_capacity_fn)(void *);
-typedef void *(nvm_tgt_init_fn)(struct nvm_tgt_dev *, struct gendisk *,
-				int flags);
+typedef void *(nvm_tgt_init_fn)(struct nvm_tgt_dev *, struct gendisk **,
+				struct nvm_ioctl_create *create);
 typedef void (nvm_tgt_exit_fn)(void *, bool);
 typedef int (nvm_tgt_sysfs_init_fn)(struct gendisk *);
 typedef void (nvm_tgt_sysfs_exit_fn)(struct gendisk *);
@@ -683,6 +689,10 @@ extern int nvm_set_chunk_meta(struct nvm_tgt_dev *, struct ppa_addr *,
 extern int nvm_submit_io(struct nvm_tgt_dev *, struct nvm_rq *);
 extern int nvm_submit_io_sync(struct nvm_tgt_dev *, struct nvm_rq *);
 extern void nvm_end_io(struct nvm_rq *);
+
+extern struct nvm_tgt_dev *nvm_fs_get_dev(const char *name,
+							int begin, int end);
+extern void nvm_fs_put_dev(struct nvm_tgt_dev *tgt_dev);
 
 #else /* CONFIG_NVM */
 struct nvm_dev_ops;
