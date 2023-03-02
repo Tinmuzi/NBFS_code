@@ -319,7 +319,6 @@ static int __nvm_config_extended(struct nvm_dev *dev,
 static int nvm_create_tgt(struct nvm_dev *dev, struct nvm_ioctl_create *create)
 {
 	struct nvm_ioctl_create_extended e;
-	struct request_queue *tqueue;
 	struct gendisk *tdisk;
 	struct nvm_tgt_type *tt;
 	struct nvm_target *t;
@@ -383,40 +382,20 @@ static int nvm_create_tgt(struct nvm_dev *dev, struct nvm_ioctl_create *create)
 		goto err_t;
 	}
 
-	tdisk = alloc_disk(0);
-	if (!tdisk) {
-		ret = -ENOMEM;
-		goto err_dev;
-	}
-
-	tqueue = blk_alloc_queue_node(GFP_KERNEL, dev->q->node);
-	if (!tqueue) {
-		ret = -ENOMEM;
-		goto err_disk;
-	}
-	blk_queue_make_request(tqueue, tt->make_rq);
-
-	strlcpy(tdisk->disk_name, create->tgtname, sizeof(tdisk->disk_name));
-	tdisk->flags = GENHD_FL_EXT_DEVT;
-	tdisk->major = 0;
-	tdisk->first_minor = 0;
-	tdisk->fops = &nvm_fops;
-	tdisk->queue = tqueue;
-
-	targetdata = tt->init(tgt_dev, tdisk, create->flags);
+	targetdata = tt->init(tgt_dev, &tdisk, create);
 	if (IS_ERR(targetdata)) {
 		ret = PTR_ERR(targetdata);
 		goto err_init;
 	}
 
-	tdisk->private_data = targetdata;
-	tqueue->queuedata = targetdata;
+	barrier();
 
-	blk_queue_max_hw_sectors(tqueue,
-			(dev->geo.csecs >> 9) * NVM_MAX_VLBA);
-
-	set_capacity(tdisk, tt->capacity(targetdata));
-	add_disk(tdisk);
+	/*
+	 * It's driver's responsibility to allocate
+	 * a gendisk and add it into the kernel.
+	 */
+	if (!tdisk)
+		pr_err("%s, tdisk==NULL\n", __func__);
 
 	if (tt->sysfs_init && tt->sysfs_init(tdisk)) {
 		ret = -ENOMEM;
@@ -438,11 +417,6 @@ err_sysfs:
 	if (tt->exit)
 		tt->exit(targetdata, true);
 err_init:
-	blk_cleanup_queue(tqueue);
-	tdisk->queue = NULL;
-err_disk:
-	put_disk(tdisk);
-err_dev:
 	nvm_remove_tgt_dev(tgt_dev, 0);
 err_t:
 	kfree(t);
@@ -455,10 +429,6 @@ static void __nvm_remove_target(struct nvm_target *t, bool graceful)
 {
 	struct nvm_tgt_type *tt = t->type;
 	struct gendisk *tdisk = t->disk;
-	struct request_queue *q = tdisk->queue;
-
-	del_gendisk(tdisk);
-	blk_cleanup_queue(q);
 
 	if (tt->sysfs_exit)
 		tt->sysfs_exit(tdisk);
@@ -467,7 +437,6 @@ static void __nvm_remove_target(struct nvm_target *t, bool graceful)
 		tt->exit(tdisk->private_data, graceful);
 
 	nvm_remove_tgt_dev(t->dev, 1);
-	put_disk(tdisk);
 	module_put(t->type->owner);
 
 	list_del(&t->list);
@@ -1189,6 +1158,51 @@ void nvm_unregister(struct nvm_dev *dev)
 	nvm_free(dev);
 }
 EXPORT_SYMBOL(nvm_unregister);
+
+struct nvm_tgt_dev *nvm_fs_get_dev(const char *name,
+							int begin, int end)
+{
+	struct nvm_dev *dev;
+	struct nvm_tgt_dev *tgt_dev;
+
+	down_write(&nvm_lock);
+	dev = nvm_find_nvm_dev(name);
+	up_write(&nvm_lock);
+	if (!dev) {
+		pr_err("%s: device not found\n",
+				__func__);
+		return NULL;
+	}
+
+	if(nvm_reserve_luns(dev, begin, end))
+		return NULL;
+
+	tgt_dev = nvm_create_tgt_dev(dev,
+					begin, end,
+					NVM_TARGET_DEFAULT_OP);
+	if (!tgt_dev) {
+		pr_err("%s: could not create target device\n",
+					__func__);
+		goto err_t;
+	}
+	return tgt_dev;
+
+	nvm_remove_tgt_dev(tgt_dev, 0);
+err_t:
+	nvm_release_luns_err(dev, begin, end);
+	return NULL;
+}
+EXPORT_SYMBOL(nvm_fs_get_dev);
+
+void nvm_fs_put_dev(struct nvm_tgt_dev *tgt_dev)
+{
+	if (!tgt_dev)
+		return;
+	mutex_lock(&tgt_dev->parent->mlock);
+	nvm_remove_tgt_dev(tgt_dev, 1);
+	mutex_unlock(&tgt_dev->parent->mlock);
+}
+EXPORT_SYMBOL(nvm_fs_put_dev);
 
 static int __nvm_configure_create(struct nvm_ioctl_create *create)
 {
