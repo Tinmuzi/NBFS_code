@@ -667,6 +667,29 @@ static struct request *nvme_nvm_alloc_request(struct request_queue *q,
 	return rq;
 }
 
+static int nvme_nvm_submit_io_nowait(struct nvm_dev *dev, struct nvm_rq *rqd)
+{
+	struct request_queue *q = dev->q;
+	struct nvme_nvm_command *cmd;
+	struct request *rq;
+
+	cmd = kzalloc(sizeof(struct nvme_nvm_command), GFP_ATOMIC);
+	if (!cmd)
+		return -ENOMEM;
+
+	rq = nvme_nvm_alloc_request(q, rqd, cmd);
+	if (IS_ERR(rq)) {
+		kfree(cmd);
+		return PTR_ERR(rq);
+	}
+
+	rq->end_io_data = rqd;
+
+	blk_execute_rq_nowait(q, NULL, rq, 0, nvme_nvm_end_io);
+
+	return 0;
+}
+
 static int nvme_nvm_submit_io(struct nvm_dev *dev, struct nvm_rq *rqd)
 {
 	struct request_queue *q = dev->q;
@@ -753,7 +776,7 @@ static struct nvm_dev_ops nvme_nvm_dev_ops = {
 
 	.get_chk_meta		= nvme_nvm_get_chk_meta,
 
-	.submit_io		= nvme_nvm_submit_io,
+	.submit_io		= nvme_nvm_submit_io_nowait,
 	.submit_io_sync		= nvme_nvm_submit_io_sync,
 
 	.create_dma_pool	= nvme_nvm_create_dma_pool,

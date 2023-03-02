@@ -356,6 +356,11 @@ static bool nvme_dbbuf_update_and_check_event(u16 value, u32 *dbbuf_db,
 		old_value = *dbbuf_db;
 		*dbbuf_db = value;
 
+		/* Disable Doorbell Writes for FEMU: We only need to 
+		 * add the following statement */
+		return false;
+		/* End FEMU modification for NVMe driver */
+
 		/*
 		 * Ensure that the doorbell is updated before reading the event
 		 * index from memory.  The controller needs to provide similar
