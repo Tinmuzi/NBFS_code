@@ -40,6 +40,12 @@
  */
 #define BIO_INLINE_VECS		4
 
+#define BM(x, n) { .nr_vecs = x, .name = "biometa-"#n }
+static struct biovec_slab bvec_meta[BVEC_POOL_NR] __read_mostly = {
+	BM(1, 1), BM(4, 4), BM(16, 16), BM(64, 64), BM(128, 128), BM(BIO_MAX_PAGES, max),
+};
+#undef BM
+
 /*
  * if you change this list, also change bvec_alloc or things will
  * break badly! cannot be bigger than what you can fit into an
@@ -178,6 +184,24 @@ void bvec_free(mempool_t *pool, struct bio_vec *bv, unsigned int idx)
 	}
 }
 
+void bmeta_free(mempool_t *pool, unsigned long **bm, unsigned short idx)
+{
+	if (!idx)
+		return;
+	idx--;
+
+	BIO_BUG_ON(idx >= BVEC_POOL_NR);
+
+	if (idx == BVEC_POOL_MAX) {
+		mempool_free(bm, pool);
+	} else {
+		struct biovec_slab *bms = bvec_meta + idx;
+
+		kmem_cache_free(bms->slab, bm);
+	}
+}
+
+
 struct bio_vec *bvec_alloc(gfp_t gfp_mask, int nr, unsigned long *idx,
 			   mempool_t *pool)
 {
@@ -242,6 +266,75 @@ fallback:
 	return bvl;
 }
 
+unsigned long **bmeta_alloc(gfp_t gfp_mask, int nr, unsigned long *idx,
+			   mempool_t *pool)
+{
+	unsigned long **bml;
+
+	/*
+	 * see comment near bvec_array define!
+	 */
+	switch (nr) {
+	case 1:
+		*idx = 0;
+		break;
+	case 2 ... 4:
+		*idx = 1;
+		break;
+	case 5 ... 16:
+		*idx = 2;
+		break;
+	case 17 ... 64:
+		*idx = 3;
+		break;
+	case 65 ... 128:
+		*idx = 4;
+		break;
+	case 129 ... BIO_MAX_PAGES:
+		*idx = 5;
+		break;
+	default:
+		return NULL;
+	}
+
+	//printk("%s, nrmeta=%d, idx=%lu\n",
+	//		__func__, nr, *idx);
+	/*
+	 * idx now points to the pool we want to allocate from. only the
+	 * 1-vec entry pool is mempool backed.
+	 */
+	if (*idx == BVEC_POOL_MAX) {
+fallback:
+		bml = mempool_alloc(pool, gfp_mask);
+	} else {
+		struct biovec_slab *bvs = bvec_meta + *idx;
+		gfp_t __gfp_mask = gfp_mask & ~(__GFP_DIRECT_RECLAIM | __GFP_IO);
+
+		/*
+		 * Make this allocation restricted and don't dump info on
+		 * allocation failures, since we'll fallback to the mempool
+		 * in case of failure.
+		 */
+		__gfp_mask |= __GFP_NOMEMALLOC | __GFP_NORETRY | __GFP_NOWARN;
+
+		/*
+		 * Try a slab allocation. If this fails and __GFP_DIRECT_RECLAIM
+		 * is set, retry with the 1-entry mempool
+		 */
+		bml = kmem_cache_alloc(bvs->slab, __gfp_mask);
+		if (unlikely(!bml && (gfp_mask & __GFP_DIRECT_RECLAIM))) {
+			*idx = BVEC_POOL_MAX;
+			goto fallback;
+		}
+	}
+
+	if (bml)
+		memset(bml, 0, nr * sizeof(unsigned long *));
+
+	(*idx)++;
+	return bml;
+}
+
 void bio_uninit(struct bio *bio)
 {
 	bio_disassociate_blkg(bio);
@@ -256,6 +349,10 @@ static void bio_free(struct bio *bio)
 	bio_uninit(bio);
 
 	if (bs) {
+		if (bio_has_metadata(bio)) {
+			bmeta_free(&bs->bmeta_pool, bio->bi_meta.bi_metabase, bio->bi_meta.idx);
+		}
+
 		bvec_free(&bs->bvec_pool, bio->bi_io_vec, BVEC_POOL_IDX(bio));
 
 		/*
@@ -438,12 +535,14 @@ static void punt_bios_to_rescuer(struct bio_set *bs)
 struct bio *bio_alloc_bioset(gfp_t gfp_mask, unsigned int nr_iovecs,
 			     struct bio_set *bs)
 {
-	gfp_t saved_gfp = gfp_mask;
+	gfp_t saved_gfp = gfp_mask | __GFP_ZERO;
 	unsigned front_pad;
 	unsigned inline_vecs;
 	struct bio_vec *bvl = NULL;
 	struct bio *bio;
 	void *p;
+
+	gfp_mask |= __GFP_ZERO;
 
 	if (!bs) {
 		if (nr_iovecs > UIO_MAXIOV)
@@ -531,6 +630,137 @@ err_free:
 	return NULL;
 }
 EXPORT_SYMBOL(bio_alloc_bioset);
+
+struct bio *bio_alloc_bioset_withmeta(gfp_t gfp_mask, unsigned int nr_iovecs,
+				unsigned int nr_meta,
+			    struct bio_set *bs)
+{
+	gfp_t saved_gfp = gfp_mask | __GFP_ZERO;
+	unsigned front_pad;
+	unsigned inline_vecs;
+	struct bio_vec *bvl = NULL;
+	unsigned long **bml = NULL;
+	struct bio *bio;
+	void *p;
+	unsigned long idxmeta = 0;
+
+	gfp_mask |= __GFP_ZERO;
+
+	if (!bs) {
+		if (nr_iovecs > UIO_MAXIOV)
+			return NULL;
+
+		p = kmalloc(sizeof(struct bio) +
+			    nr_iovecs * sizeof(struct bio_vec),
+			    gfp_mask);
+		front_pad = 0;
+		inline_vecs = nr_iovecs;
+	} else {
+		/* should not use nobvec bioset for nr_iovecs > 0 */
+		if (WARN_ON_ONCE(!mempool_initialized(&bs->bvec_pool) &&
+				 nr_iovecs > 0))
+			return NULL;
+
+		if (WARN_ON_ONCE(!mempool_initialized(&bs->bmeta_pool) &&
+				 nr_iovecs > 0))
+			return NULL;
+		/*
+		 * generic_make_request() converts recursion to iteration; this
+		 * means if we're running beneath it, any bios we allocate and
+		 * submit will not be submitted (and thus freed) until after we
+		 * return.
+		 *
+		 * This exposes us to a potential deadlock if we allocate
+		 * multiple bios from the same bio_set() while running
+		 * underneath generic_make_request(). If we were to allocate
+		 * multiple bios (say a stacking block driver that was splitting
+		 * bios), we would deadlock if we exhausted the mempool's
+		 * reserve.
+		 *
+		 * We solve this, and guarantee forward progress, with a rescuer
+		 * workqueue per bio_set. If we go to allocate and there are
+		 * bios on current->bio_list, we first try the allocation
+		 * without __GFP_DIRECT_RECLAIM; if that fails, we punt those
+		 * bios we would be blocking to the rescuer workqueue before
+		 * we retry with the original gfp_flags.
+		 */
+
+		if (current->bio_list &&
+		    (!bio_list_empty(&current->bio_list[0]) ||
+		     !bio_list_empty(&current->bio_list[1])) &&
+		    bs->rescue_workqueue)
+			gfp_mask &= ~__GFP_DIRECT_RECLAIM;
+
+		p = mempool_alloc(&bs->bio_pool, gfp_mask);
+		if (!p && gfp_mask != saved_gfp) {
+			punt_bios_to_rescuer(bs);
+			gfp_mask = saved_gfp;
+			p = mempool_alloc(&bs->bio_pool, gfp_mask);
+		}
+
+		front_pad = bs->front_pad;
+		inline_vecs = BIO_INLINE_VECS;
+	}
+
+	if (unlikely(!p))
+		return NULL;
+
+	bio = p + front_pad;
+	bio_init(bio, NULL, 0);
+
+	if (nr_iovecs > inline_vecs) {
+		unsigned long idx = 0;
+
+		bvl = bvec_alloc(gfp_mask, nr_iovecs, &idx, &bs->bvec_pool);
+		if (!bvl && gfp_mask != saved_gfp) {
+			punt_bios_to_rescuer(bs);
+			gfp_mask = saved_gfp;
+			bvl = bvec_alloc(gfp_mask, nr_iovecs, &idx, &bs->bvec_pool);
+		}
+
+		if (unlikely(!bvl))
+			goto err_free;
+
+		bio->bi_flags |= idx << BVEC_POOL_OFFSET;
+	} else if (nr_iovecs) {
+		bvl = bio->bi_inline_vecs;
+	}
+
+	bio->bi_pool = bs;
+	bio->bi_max_vecs = nr_iovecs;
+	bio->bi_io_vec = bvl;
+
+	/* Allocate bmeta */
+	if (bs) {
+		bml = bmeta_alloc(gfp_mask, nr_meta, &idxmeta, &bs->bmeta_pool);
+		if (!bml && gfp_mask != saved_gfp) {
+			punt_bios_to_rescuer(bs);
+			gfp_mask = saved_gfp;
+			bml = bmeta_alloc(gfp_mask, nr_meta, &idxmeta, &bs->bmeta_pool);
+		}
+		if (unlikely(!bml))
+			goto err_free2;
+
+		bio->bi_meta.idx = idxmeta;
+		bio->bi_meta.bi_metabase = bml;
+		bio->bi_meta.bi_metafilled = 0;
+		bio->bi_meta.iter = 0;
+
+		//printk(KERN_NOTICE"%s, metaidx=%lu\n",
+		//			__func__, idxmeta);
+	}
+
+	//idx need to be stored!
+	return bio;
+
+err_free2:
+	bvec_free(&bs->bvec_pool, bvl, BVEC_POOL_IDX(bio));
+err_free:
+	mempool_free(p, &bs->bio_pool);
+	return NULL;
+}
+EXPORT_SYMBOL(bio_alloc_bioset_withmeta);
+
 
 void zero_fill_bio_iter(struct bio *bio, struct bvec_iter start)
 {
@@ -787,6 +1017,37 @@ bool __bio_try_merge_page(struct bio *bio, struct page *page,
 }
 EXPORT_SYMBOL_GPL(__bio_try_merge_page);
 
+bool __bio_try_merge_page_withmeta(struct bio *bio, struct page *page,
+		unsigned int len, unsigned int off, unsigned long *pmeta, bool same_page)
+{
+	if (WARN_ON_ONCE(bio_flagged(bio, BIO_CLONED)))
+		return false;
+
+	if (bio->bi_vcnt > 0) {
+		struct bio_vec *bv = &bio->bi_io_vec[bio->bi_vcnt - 1];
+		phys_addr_t vec_end_addr = page_to_phys(bv->bv_page) +
+			bv->bv_offset + bv->bv_len - 1;
+		phys_addr_t page_addr = page_to_phys(page);
+		unsigned long **metabase = bio->bi_meta.bi_metabase;
+
+		if (vec_end_addr + 1 != page_addr + off)
+			return false;
+		if (same_page && (vec_end_addr & PAGE_MASK) != page_addr)
+			return false;
+
+		bv->bv_len += len;
+		bio->bi_iter.bi_size += len;
+
+		WARN_ON_ONCE(!metabase);
+		if (metabase)
+			metabase[bio->bi_meta.bi_metafilled++] = pmeta;
+		return true;
+	}
+	return false;
+}
+EXPORT_SYMBOL_GPL(__bio_try_merge_page_withmeta);
+
+
 /**
  * __bio_add_page - add page to a bio in a new segment
  * @bio: destination bio
@@ -814,6 +1075,27 @@ void __bio_add_page(struct bio *bio, struct page *page,
 }
 EXPORT_SYMBOL_GPL(__bio_add_page);
 
+static void __bio_add_page_with_meta(struct bio *bio, struct page *page,
+		unsigned int len, unsigned int off, unsigned long *pmeta)
+{
+	struct bio_vec *bv = &bio->bi_io_vec[bio->bi_vcnt];
+	unsigned long **metabase = bio->bi_meta.bi_metabase;
+
+	WARN_ON_ONCE(bio_flagged(bio, BIO_CLONED));
+	WARN_ON_ONCE(bio_full(bio));
+	WARN_ON_ONCE(!metabase);
+
+	bv->bv_page = page;
+	bv->bv_offset = off;
+	bv->bv_len = len;
+
+	if (metabase)
+		metabase[bio->bi_meta.bi_metafilled++] = pmeta;
+
+	bio->bi_iter.bi_size += len;
+	bio->bi_vcnt++;
+}
+
 /**
  *	bio_add_page	-	attempt to add page to bio
  *	@bio: destination bio
@@ -835,6 +1117,30 @@ int bio_add_page(struct bio *bio, struct page *page,
 	return len;
 }
 EXPORT_SYMBOL(bio_add_page);
+
+/**
+ *	bio_add_page_with_meta	-	attempt to add page to bio
+ *	@bio: destination bio
+ *	@page: page to add
+ *	@len: vec entry length
+ *	@offset: vec entry offset
+ *  @meta: page metadata
+ *
+ *	If the bio doesn't have space for metadata, this function simply
+ *  ignores the metadata.
+ */
+int bio_add_page_with_meta(struct bio *bio, struct page *page,
+		 unsigned int len, unsigned int offset, unsigned long *pmeta)
+{
+	if (!__bio_try_merge_page_withmeta(bio, page, len, offset, pmeta, false)) {
+		if (bio_full(bio))
+			return 0;
+		__bio_add_page_with_meta(bio, page, len, offset, pmeta);
+	}
+	return len;
+}
+EXPORT_SYMBOL(bio_add_page_with_meta);
+
 
 static int __bio_iov_bvec_add_pages(struct bio *bio, struct iov_iter *iter)
 {
@@ -1004,6 +1310,8 @@ void bio_advance(struct bio *bio, unsigned bytes)
 {
 	if (bio_integrity(bio))
 		bio_integrity_advance(bio, bytes);
+
+	bio->bi_meta.iter++;
 
 	bio_advance_iter(bio, &bio->bi_iter, bytes);
 }
@@ -1944,6 +2252,14 @@ int biovec_init_pool(mempool_t *pool, int pool_entries)
 	return mempool_init_slab_pool(pool, pool_entries, bp->slab);
 }
 
+int biometa_init_pool(mempool_t *pool, int pool_entries)
+{
+	struct biovec_slab *bp = bvec_meta + BVEC_POOL_MAX;
+
+	return mempool_init_slab_pool(pool, pool_entries, bp->slab);
+}
+
+
 /*
  * bioset_exit - exit a bioset initialized with bioset_init()
  *
@@ -1958,6 +2274,7 @@ void bioset_exit(struct bio_set *bs)
 
 	mempool_exit(&bs->bio_pool);
 	mempool_exit(&bs->bvec_pool);
+	mempool_exit(&bs->bmeta_pool);
 
 	bioset_integrity_free(bs);
 	if (bs->bio_slab)
@@ -2009,6 +2326,10 @@ int bioset_init(struct bio_set *bs,
 
 	if ((flags & BIOSET_NEED_BVECS) &&
 	    biovec_init_pool(&bs->bvec_pool, pool_size))
+		goto bad;
+
+	if ((flags & BIOSET_NEED_BMETA) &&
+	    biometa_init_pool(&bs->bmeta_pool, pool_size))
 		goto bad;
 
 	if (!(flags & BIOSET_NEED_RESCUER))
@@ -2197,6 +2518,25 @@ static void __init biovec_init_slabs(void)
 	}
 }
 
+static void __init biovec_init_meta(void)
+{
+	int i;
+
+	printk(KERN_NOTICE"%s\n", __func__);
+	for (i = 0; i < BVEC_POOL_NR; i++) {
+		int size;
+		struct biovec_slab *bvs = bvec_meta + i;
+
+		size = bvs->nr_vecs * sizeof(unsigned long *);
+		bvs->slab = kmem_cache_create(bvs->name, size, 0,
+                                SLAB_HWCACHE_ALIGN|SLAB_PANIC, NULL);
+		printk(KERN_NOTICE"%s-create bio meta slab size %d\n",
+						__func__,
+						size);
+	}
+}
+
+
 static int __init init_bio(void)
 {
 	bio_slab_max = 2;
@@ -2208,8 +2548,9 @@ static int __init init_bio(void)
 
 	bio_integrity_init();
 	biovec_init_slabs();
+	biovec_init_meta();
 
-	if (bioset_init(&fs_bio_set, BIO_POOL_SIZE, 0, BIOSET_NEED_BVECS))
+	if (bioset_init(&fs_bio_set, BIO_POOL_SIZE, 0, BIOSET_NEED_BVECS | BIOSET_NEED_BMETA))
 		panic("bio: can't allocate bios\n");
 
 	if (bioset_integrity_create(&fs_bio_set, BIO_POOL_SIZE))
